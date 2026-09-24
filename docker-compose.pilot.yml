@@ -1,0 +1,32 @@
+# Local controlled-pilot services for Custodian.
+#
+# Redis is an optional, short-lived live-state cache. It is not the source of
+# truth and is disabled in the default demo configuration. Only the host port is
+# bound to loopback; Redis persistence is disabled because this is a cache.
+#
+#   docker compose -f docker-compose.pilot.yml up -d
+#   docker compose -f docker-compose.pilot.yml down
+#
+# Never commit real passwords or a .env.pilot file. This MVP cache uses no auth
+# because it is loopback-only; add credentials only under a future security design.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: custodian-pilot-redis
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --protected-mode
+      - "yes"
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped

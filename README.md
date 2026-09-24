@@ -494,6 +494,7 @@ Check that the applicable detector reports `READY`, then inspect flows and evide
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Architecture](docs/architecture.md)
 - [API reference](docs/api.md)
+- [Controlled pilot data layer (optional Redis cache)](docs/CONTROLLED_PILOT_DATA_LAYER.md)
 - [Website runtime expectations](docs/WEBSITE_RUNTIME_EXPECTATIONS.md)
 - [Judge demonstration runbook](docs/demo-runbook.md)
 - [External model validation](docs/EXTERNAL_MODEL_VALIDATION.md)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -12,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from custodian.core.enums import FeatureFamily, ReplayMode
 
 ConfigType = TypeVar("ConfigType", bound=BaseModel)
+
+LOOPBACK_REDIS_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 class SettingsModel(BaseModel):
@@ -149,6 +152,36 @@ class StorageSettings(SettingsModel):
     max_database_bytes: int = Field(default=1_073_741_824, gt=0)
 
 
+class RedisSettings(SettingsModel):
+    """Optional, loopback-only short-lived live-state cache configuration."""
+
+    enabled: bool = False
+    url: str = "redis://127.0.0.1:6379/0"
+    namespace: str = Field(
+        default="custodian:pilot", min_length=1, pattern=r"^[A-Za-z0-9:_-]+$"
+    )
+    ttl_seconds: int = Field(default=900, gt=0, le=86_400)
+    max_history: int = Field(default=500, ge=1, le=5_000)
+    connect_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
+    socket_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
+    host_timeline: bool = False
+
+    @model_validator(mode="after")
+    def validate_loopback_endpoint(self) -> RedisSettings:
+        parsed = urlparse(self.url)
+        if parsed.scheme not in {"redis", "rediss"}:
+            raise ValueError("redis url must use the redis:// or rediss:// scheme")
+        if parsed.hostname is None:
+            raise ValueError("redis url must include a host")
+        if parsed.hostname not in LOOPBACK_REDIS_HOSTS:
+            raise ValueError(
+                "controlled pilot requires a loopback Redis host "
+                f"({', '.join(sorted(LOOPBACK_REDIS_HOSTS))}); "
+                f"refusing non-loopback host {parsed.hostname!r}"
+            )
+        return self
+
+
 class ConfigBundle(SettingsModel):
     defaults: DefaultSettings
     replay: ReplaySettings
@@ -156,6 +189,7 @@ class ConfigBundle(SettingsModel):
     severity: SeveritySettings
     models: ModelsSettings
     storage: StorageSettings
+    redis: RedisSettings = Field(default_factory=RedisSettings)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -170,6 +204,25 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 def _validate_file(path: Path, model: type[ConfigType]) -> ConfigType:
     return model.model_validate(_load_yaml(path))
+
+
+def _load_redis_settings(directory: Path) -> RedisSettings:
+    """Resolve Redis settings from explicit, local, or repository config plus env."""
+
+    override = os.environ.get("CUSTODIAN_REDIS_CONFIG")
+    if override:
+        path = Path(override)
+        if not path.is_absolute():
+            path = directory / path
+    elif (directory / "redis.local.yaml").is_file():
+        path = directory / "redis.local.yaml"
+    else:
+        path = directory / "redis.yaml"
+    raw: dict[str, Any] = _load_yaml(path) if path.is_file() else {}
+    url_override = os.environ.get("CUSTODIAN_REDIS_URL")
+    if url_override:
+        raw = {**raw, "url": url_override}
+    return RedisSettings.model_validate(raw)
 
 
 def load_config_bundle(config_dir: str | Path) -> ConfigBundle:
@@ -187,6 +240,7 @@ def load_config_bundle(config_dir: str | Path) -> ConfigBundle:
         severity=_validate_file(directory / "severity.yaml", SeveritySettings),
         models=_validate_file(models_path, ModelsSettings),
         storage=_validate_file(directory / "storage.yaml", StorageSettings),
+        redis=_load_redis_settings(directory),
     )
     root = directory.resolve().parent
 

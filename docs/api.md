@@ -144,12 +144,18 @@ Representative degraded response:
     "event_stream": {"status": "ready", "reason": null},
     "database": {"status": "ready", "reason": null},
     "models": {},
+    "redis": {
+      "status": "disabled",
+      "reason": "Redis live-state cache is disabled by configuration"
+    },
     "inputs": {}
   }
 }
 ```
 
 `degraded` does not necessarily mean replay is broken. It commonly means parsing remains ready while one or more model artifacts are unavailable, untrusted, incomplete, or incompatible.
+
+The `redis` component reports the optional short-lived live-state cache: `ready`, `degraded`, `unavailable`, or `disabled`. Redis status never changes the overall readiness decision or stops replay. See [Controlled pilot data layer](CONTROLLED_PILOT_DATA_LAYER.md).
 
 ## Runtime and replay status
 

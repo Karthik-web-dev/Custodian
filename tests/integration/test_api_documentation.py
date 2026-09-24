@@ -140,8 +140,10 @@ def test_documented_http_examples_work_locally(tmp_path: Path) -> None:
             "event_stream",
             "database",
             "models",
+            "redis",
             "inputs",
         }
+        assert readiness["components"]["redis"]["status"] == "disabled"
 
         status = client.get("/api/v1/status").json()
         assert client.get("/api/v1/replay/status").json() == status

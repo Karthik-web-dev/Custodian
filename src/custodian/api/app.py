@@ -35,7 +35,7 @@ from custodian.ingestion import adapter_statuses
 from custodian.ingestion.validation import CaptureValidator
 from custodian.runtime.engine import CustodianEngine
 from custodian.runtime.events import EventHub
-from custodian.storage import SQLiteRepository
+from custodian.storage import RedisLiveStateCache, SQLiteRepository
 
 API_DESCRIPTION = """
 Local, passive-only API for authorized capture-file analysis. Custodian reads packets from
@@ -87,10 +87,12 @@ class ReplaySession:
         config: ConfigBundle,
         repository: SQLiteRepository | None = None,
         event_hub: EventHub | None = None,
+        live_state: RedisLiveStateCache | None = None,
     ) -> None:
         self.engine, self.config = engine, config
         self.repository = repository
         self.event_hub = event_hub or EventHub()
+        self.live_state = live_state or RedisLiveStateCache(config.redis)
         self.capture_root = config.replay.capture_root.resolve()
         self.validator = CaptureValidator(
             self.capture_root, max_size_bytes=config.replay.max_capture_size_bytes
@@ -112,6 +114,52 @@ class ReplaySession:
             self.repository.record_event(
                 event.event_id, event.event_type, event.model_dump(mode="json")
             )
+        serialized = event.model_dump(mode="json")
+        self.live_state.set_latest_event(serialized)
+        self.live_state.append_recent_event(serialized)
+
+    def sync_live_state(self) -> None:
+        """Best-effort mirror of bounded runtime state into the optional cache."""
+
+        status = self.status()
+        detectors = self.engine.detector_status()
+        self.live_state.set_replay_status(status)
+        self.live_state.set_detectors({"run_id": self.run_id, "detectors": detectors})
+        self.live_state.set_telemetry(
+            {
+                "run_id": self.run_id,
+                "status": status,
+                "metrics": self.engine.metrics.snapshot(
+                    interval_seconds=self.telemetry_interval
+                ),
+                "detectors": detectors,
+            }
+        )
+        if self.config.redis.host_timeline:
+            self.live_state.set_host_timeline(list(self.engine.host_timeline))
+
+    @staticmethod
+    def _alert_summary(alert: AlertRecord) -> dict:
+        """Bounded alert metadata; never raw packets, tokens, or full evidence."""
+
+        return {
+            "alert_id": alert.alert_id,
+            "capture_id": alert.capture_id,
+            "timestamp": alert.timestamp.isoformat(),
+            "threat_class": alert.threat_class.value,
+            "severity": alert.severity.value,
+            "decision": alert.decision.value,
+            "status": alert.status.value,
+            "evidence_quality": alert.evidence_quality.value,
+            "occurrence_count": alert.occurrence_count,
+            "detector_id": alert.detector_id,
+            "model_version": alert.model_version,
+            "calibrated_confidence": alert.calibrated_confidence,
+            "source": alert.source.model_dump(mode="json") if alert.source else None,
+            "destination": alert.destination.model_dump(mode="json")
+            if alert.destination
+            else None,
+        }
 
     def validate(self, capture: str):
         with self._lock:
@@ -142,6 +190,7 @@ class ReplaySession:
         self._publish(
             "capture.ready", {"capture_id": record.capture_id, "name": record.display_name}
         )
+        self.sync_live_state()
         return record
 
     def _set_capture_status(self, status: CaptureStatus, failure_reason: str | None = None) -> None:
@@ -213,6 +262,7 @@ class ReplaySession:
             controller = self.controller
             self._set_capture_status(CaptureStatus.RUNNING)
             self._publish("replay.started", {"capture": capture, "mode": controller.mode.value})
+            self.sync_live_state()
             self._launch(controller)
 
     def _launch(self, controller: ReplayController) -> None:
@@ -223,10 +273,12 @@ class ReplaySession:
                         record = self.validated.get(self.capture or "")
                         capture_id = getattr(record, "capture_id", None)
                         self.repository.upsert_alert(alert, capture_id=capture_id)
+                    self.live_state.append_recent_alert(self._alert_summary(alert))
                     self._publish(
                         "alert.upserted",
                         {"alert_id": alert.alert_id, "decision": alert.decision.value},
                     )
+                    self.sync_live_state()
                 if self.repository:
                     record = self.validated.get(self.capture or "")
                     capture_id = record.capture_id if record else None
@@ -241,12 +293,14 @@ class ReplaySession:
                         "replay.completed" if controller.completed else "replay.stopped",
                         {"capture": self.capture, "progress": controller.progress},
                     )
+                    self.sync_live_state()
             except Exception as exc:
                 with self._lock:
                     self.error = str(exc)
                     self.state = "ERROR"
                     self._set_capture_status(CaptureStatus.FAILED, str(exc))
                     self._publish("replay.failed", {"capture": self.capture, "reason": str(exc)})
+                    self.sync_live_state()
             finally:
                 with self._lock:
                     self.running = False
@@ -307,6 +361,7 @@ class ReplaySession:
                 )
             self._set_capture_status(CaptureStatus.RUNNING)
             self._publish("replay.seeked", {"target_progress": target_progress})
+            self.sync_live_state()
             self._launch(controller)
 
     def pause(self):
@@ -318,6 +373,7 @@ class ReplaySession:
             self.state = "PAUSED"
             self._set_capture_status(CaptureStatus.PAUSED)
             self._publish("replay.paused", {"capture": self.capture})
+            self.sync_live_state()
 
     def resume(self):
         with self._lock:
@@ -328,6 +384,7 @@ class ReplaySession:
             self.state = "RUNNING"
             self._set_capture_status(CaptureStatus.RUNNING)
             self._publish("replay.resumed", {"capture": self.capture})
+            self.sync_live_state()
 
     def stop(self):
         with self._lock:
@@ -336,6 +393,7 @@ class ReplaySession:
             self.state = "STOPPING"
             self.controller.stop()
             self._publish("replay.stop_requested", {"capture": self.capture})
+            self.sync_live_state()
 
     def reset(self):
         with self._lock:
@@ -346,6 +404,7 @@ class ReplaySession:
             self.state = "IDLE"
             self.run_id += 1
             self.capture_size_bytes = 0
+            self.sync_live_state()
 
     def status(self):
         controller = self.controller
@@ -376,7 +435,9 @@ class ReplaySession:
         }
 
 
-def create_app(config: ConfigBundle) -> FastAPI:
+def create_app(
+    config: ConfigBundle, *, live_state: RedisLiveStateCache | None = None
+) -> FastAPI:
     engine = CustodianEngine(config)
     repository = None
     storage_error = None
@@ -394,7 +455,8 @@ def create_app(config: ConfigBundle) -> FastAPI:
             storage_error = str(exc)
             repository = None
     event_hub = EventHub(max_events=min(config.defaults.max_temporal_events, 5000))
-    session = ReplaySession(engine, config, repository, event_hub)
+    live_state = live_state or RedisLiveStateCache(config.redis)
+    session = ReplaySession(engine, config, repository, event_hub, live_state)
     if repository:
         for payload in reversed(repository.list_alerts(limit=min(config.defaults.max_alerts, 500))):
             try:
@@ -409,6 +471,7 @@ def create_app(config: ConfigBundle) -> FastAPI:
             session.controller.stop()
         if session.thread:
             await asyncio.to_thread(session.thread.join, 2)
+        live_state.close()
 
     app = FastAPI(
         title="Custodian API",
@@ -422,6 +485,7 @@ def create_app(config: ConfigBundle) -> FastAPI:
     )
     app.state.engine, app.state.session = engine, session
     app.state.repository, app.state.event_hub = repository, event_hub
+    app.state.live_state = live_state
 
     @app.middleware("http")
     async def correlation_id(request: Request, call_next):
@@ -594,6 +658,7 @@ def create_app(config: ConfigBundle) -> FastAPI:
                     else storage_error or "Persistence is disabled",
                 },
                 "models": model_components,
+                "redis": live_state.readiness(),
                 "inputs": {
                     item["source_type"]: {
                         "status": item["status"],
@@ -820,7 +885,13 @@ def create_app(config: ConfigBundle) -> FastAPI:
         summary="Get combined status, metrics, and detector state",
     )
     def telemetry():
-        return {"status": status(), "metrics": metrics(), "detectors": detectors()}
+        snapshot = {"status": status(), "metrics": metrics(), "detectors": detectors()}
+        live_state.set_replay_status(snapshot["status"])
+        live_state.set_detectors(
+            {"run_id": session.run_id, "detectors": snapshot["detectors"]}
+        )
+        live_state.set_telemetry({**snapshot, "run_id": session.run_id})
+        return snapshot
 
     @app.post("/api/v1/replay/start", tags=["replay"], summary="Start passive file replay")
     def start_replay(request: ReplayStartRequest):
