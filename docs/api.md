@@ -683,7 +683,7 @@ Check `/api/v1/detectors`, `/api/v1/readiness`, and `/api/v1/diagnostics`. Traff
 
 ### Alert acknowledge/close/export returns 503
 
-The configured SQLite repository failed or persistence is disabled. Replay and in-memory telemetry can still be usable.
+The configured PostgreSQL repository failed or persistence is disabled. Replay and in-memory telemetry can still be usable.
 
 ## Compatibility policy
 

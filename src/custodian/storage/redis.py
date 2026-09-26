@@ -1,6 +1,6 @@
 """Optional short-lived live-state cache backed by loopback Redis.
 
-Redis is never the source of truth. PostgreSQL/SQLite remain durable; this cache
+Redis is never the source of truth. PostgreSQL remains durable; this cache
 stores only bounded, structured runtime metadata with an explicit TTL so the
 dashboard can read live telemetry without replaying durable history. Every
 operation is best-effort: an unavailable Redis must never stop replay, alerting,

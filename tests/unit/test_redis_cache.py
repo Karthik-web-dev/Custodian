@@ -208,9 +208,7 @@ def test_api_readiness_reports_redis_and_mirrors_telemetry(tmp_path) -> None:
         bundle.models.models[name] = entry.model_copy(update={"artifact_path": None})
     bundle = bundle.model_copy(
         update={
-            "storage": bundle.storage.model_copy(
-                update={"database_path": tmp_path / "runtime.sqlite3"}
-            )
+            "storage": bundle.storage.model_copy(update={"enabled": False})
         }
     )
     fake = FakeRedis()

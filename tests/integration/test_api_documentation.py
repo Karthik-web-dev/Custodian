@@ -25,12 +25,7 @@ def documented_app(tmp_path: Path, *, storage_enabled: bool = True):
         update={
             "models": config.models.model_copy(update={"models": model_entries}),
             "replay": config.replay.model_copy(update={"capture_root": capture_root}),
-            "storage": config.storage.model_copy(
-                update={
-                    "enabled": storage_enabled,
-                    "database_path": tmp_path / "runtime" / "custodian.sqlite3",
-                }
-            ),
+            "storage": config.storage.model_copy(update={"enabled": storage_enabled}),
         }
     )
     return create_app(config), capture_root
@@ -141,6 +136,7 @@ def test_documented_http_examples_work_locally(tmp_path: Path) -> None:
             "database",
             "models",
             "redis",
+            "kafka",
             "inputs",
         }
         assert readiness["components"]["redis"]["status"] == "disabled"
@@ -185,6 +181,7 @@ def test_documented_http_examples_work_locally(tmp_path: Path) -> None:
             "routing",
             "model_load_errors",
             "inputs",
+            "kafka",
         }
 
         events = client.get("/api/v1/events?after_sequence=0&limit=200").json()

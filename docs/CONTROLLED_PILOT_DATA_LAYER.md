@@ -6,7 +6,7 @@ live capture, does not change authentication, and does not add Kafka or Grafana.
 
 ## Purpose and boundaries
 
-PostgreSQL/SQLite remain the durable database. Redis only caches current runtime
+PostgreSQL is the durable database. Redis only caches current runtime
 state so the dashboard can read live telemetry without querying durable history
 on every refresh.
 
@@ -66,7 +66,7 @@ controlled pilot cannot point at an external Redis.
 
 ## Install
 
-Redis support is an optional dependency group, not a demo requirement:
+Redis support is optional; PostgreSQL is required for durable API records:
 
 ```bash
 pip install -e ".[pilot]"
@@ -75,11 +75,12 @@ pip install -e ".[pilot]"
 ## Start the cache
 
 ```bash
-docker compose -f docker-compose.pilot.yml up -d redis
+docker compose -f docker-compose.pilot.yml up -d postgres redis
 cp configs/redis.pilot.example.yaml configs/redis.local.yaml
 ```
 
-The Compose service binds only `127.0.0.1:6379`, disables persistence
+See [PostgreSQL pilot storage](POSTGRES_PILOT.md) to configure the durable
+database. The Redis Compose service binds only `127.0.0.1:6379`, disables persistence
 (`--save "" --appendonly no`) because it is a cache, and includes a health check.
 Never commit real passwords or a `.env.pilot` file.
 
@@ -94,7 +95,7 @@ curl http://127.0.0.1:8000/api/v1/readiness
 - `ready` — enabled, reachable, and no recent operation failed
 - `degraded` — enabled and reachable, but a recent cache operation failed
 - `unavailable` — enabled but unreachable, misconfigured, or the `redis` package is missing
-- `disabled` — the default SQLite-only demo
+- `disabled` — Redis is off; PostgreSQL persistence remains active
 
 Redis status never changes the overall readiness decision or stops processing.
 
@@ -111,7 +112,7 @@ are safe because replay never depends on Redis.
 
 Leave `enabled: false` (the default), remove `configs/redis.local.yaml`, or unset
 `CUSTODIAN_REDIS_URL`. Custodian uses the in-memory event hub and durable
-database exactly as in the SQLite-only demo. You can also stop the Redis
+database exactly as in the PostgreSQL-backed demo. You can also stop the Redis
 container while Custodian is running: writes fail open, readiness shows
 `unavailable`, and replay and alerts continue.
 
@@ -120,7 +121,7 @@ container while Custodian is running: writes fail open, readiness shows
 1. Remove `configs/redis.local.yaml` (or set `enabled: false`).
 2. Unset `CUSTODIAN_REDIS_CONFIG` and `CUSTODIAN_REDIS_URL`.
 3. `docker compose -f docker-compose.pilot.yml down`.
-4. Restart the API. The SQLite/PostgreSQL path is unchanged and complete.
+4. Restart the API. PostgreSQL remains the durable store.
 
 ## Tests
 

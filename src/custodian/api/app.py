@@ -14,7 +14,7 @@ from uuid import uuid4
 from fastapi import Cookie, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import JSONResponse
 
@@ -27,15 +27,21 @@ from custodian.api.auth import (
 )
 from custodian.config import ConfigBundle, load_config_bundle
 from custodian.core.enums import AlertStatus, CaptureStatus, ReplayMode
-from custodian.core.schemas import AlertRecord, CapturePacketCounts, CaptureRecord
+from custodian.core.schemas import AlertRecord, CapturePacketCounts, CaptureRecord, FlowRecord
 from custodian.exports import ExportService
 from custodian.ingest.pcap import SUPPORTED_DATALINKS, CaptureReader
 from custodian.ingest.replay import ReplayController
 from custodian.ingestion import adapter_statuses
 from custodian.ingestion.validation import CaptureValidator
 from custodian.runtime.engine import CustodianEngine
+from custodian.runtime.event_bus import (
+    InProcessEventBus,
+    KafkaEventBus,
+    MetadataEvent,
+    make_runtime_event,
+)
 from custodian.runtime.events import EventHub
-from custodian.storage import RedisLiveStateCache, SQLiteRepository
+from custodian.storage import PostgresRepository, RedisLiveStateCache
 
 API_DESCRIPTION = """
 Local, passive-only API for authorized capture-file analysis. Custodian reads packets from
@@ -85,14 +91,16 @@ class ReplaySession:
         self,
         engine: CustodianEngine,
         config: ConfigBundle,
-        repository: SQLiteRepository | None = None,
+        repository: PostgresRepository | None = None,
         event_hub: EventHub | None = None,
         live_state: RedisLiveStateCache | None = None,
+        event_bus: KafkaEventBus | InProcessEventBus | None = None,
     ) -> None:
         self.engine, self.config = engine, config
         self.repository = repository
         self.event_hub = event_hub or EventHub()
         self.live_state = live_state or RedisLiveStateCache(config.redis)
+        self.event_bus = event_bus or KafkaEventBus(config.kafka)
         self.capture_root = config.replay.capture_root.resolve()
         self.validator = CaptureValidator(
             self.capture_root, max_size_bytes=config.replay.max_capture_size_bytes
@@ -110,6 +118,19 @@ class ReplaySession:
 
     def _publish(self, event_type: str, payload: dict) -> None:
         event = self.event_hub.publish(event_type, payload, run_id=self.run_id)
+        kafka_event = make_runtime_event(
+            event_type="runtime_event",
+            payload={"application_event_id": event.event_id, "name": event_type},
+            run_id=self.run_id,
+            capture_id=self.engine.capture_id,
+        )
+        try:
+            self.event_bus.publish(kafka_event)
+        except Exception:
+            # Preserve local processing; failure is reported through readiness/diagnostics.
+            pass
+        if self.config.kafka.enabled:
+            self.publish_pipeline_events()
         if self.repository:
             self.repository.record_event(
                 event.event_id, event.event_type, event.model_dump(mode="json")
@@ -117,6 +138,54 @@ class ReplaySession:
         serialized = event.model_dump(mode="json")
         self.live_state.set_latest_event(serialized)
         self.live_state.append_recent_event(serialized)
+
+    def publish_pipeline_events(self) -> None:
+        """Publish bounded outputs produced by the current local replay stages."""
+        while self.engine.pipeline_events:
+            item = self.engine.pipeline_events[0]
+            try:
+                event = make_runtime_event(
+                    event_type=item["event_type"],
+                    payload=item["payload"],
+                    run_id=self.run_id,
+                    capture_id=self.engine.capture_id,
+                    correlation_id=str(
+                        item["payload"].get("flow_id")
+                        or item["payload"].get("alert_id")
+                        or item["payload"].get("vector_id")
+                        or self.engine.capture_id
+                        or f"run-{self.run_id}"
+                    ),
+                )
+                self.event_bus.publish(event)
+                self.engine.pipeline_events.pop(0)
+            except Exception as exc:
+                # Keep the event queued and fail this replay visibly.
+                raise RuntimeError(
+                    "Kafka stage event publish failed; event remains queued"
+                ) from exc
+
+    def handle_kafka_event(self, event: MetadataEvent) -> None:
+        """Idempotently store validated stage output, then mirror dashboard state."""
+        if self.repository is None:
+            raise RuntimeError("PostgreSQL unavailable for Kafka event processing")
+        cached_alert = {}
+
+        def apply(connection):
+            result = self.repository.apply_pipeline_event(connection, event)
+            if result:
+                cached_alert.update(result)
+
+        processed = self.repository.process_event_once(event.event_id, apply)
+        if processed:
+            if cached_alert:
+                self.live_state.append_recent_alert(cached_alert)
+            event_run_id = int(event.run_id) if event.run_id.isdecimal() else self.run_id
+            self.event_hub.publish(
+                "pipeline.event",
+                {"event_id": event.event_id, "event_type": event.event_type},
+                run_id=event_run_id,
+            )
 
     def sync_live_state(self) -> None:
         """Best-effort mirror of bounded runtime state into the optional cache."""
@@ -129,9 +198,7 @@ class ReplaySession:
             {
                 "run_id": self.run_id,
                 "status": status,
-                "metrics": self.engine.metrics.snapshot(
-                    interval_seconds=self.telemetry_interval
-                ),
+                "metrics": self.engine.metrics.snapshot(interval_seconds=self.telemetry_interval),
                 "detectors": detectors,
             }
         )
@@ -156,9 +223,7 @@ class ReplaySession:
             "model_version": alert.model_version,
             "calibrated_confidence": alert.calibrated_confidence,
             "source": alert.source.model_dump(mode="json") if alert.source else None,
-            "destination": alert.destination.model_dump(mode="json")
-            if alert.destination
-            else None,
+            "destination": alert.destination.model_dump(mode="json") if alert.destination else None,
         }
 
     def validate(self, capture: str):
@@ -237,6 +302,8 @@ class ReplaySession:
         with self._lock:
             if self.running:
                 raise RuntimeError("a replay is already running")
+            if self.config.kafka.enabled and self.repository is None:
+                raise RuntimeError("Kafka mode requires PostgreSQL durable event processing")
             candidate = self.validator.resolve(capture)
             record = self.validated.get(capture)
             if record is None:
@@ -268,7 +335,12 @@ class ReplaySession:
     def _launch(self, controller: ReplayController) -> None:
         def run():
             try:
-                for alert in self.engine.run_controller(controller):
+                for alert in self.engine.run_controller(
+                    controller,
+                    on_stage_events=self.publish_pipeline_events
+                    if self.config.kafka.enabled
+                    else None,
+                ):
                     if self.repository:
                         record = self.validated.get(self.capture or "")
                         capture_id = getattr(record, "capture_id", None)
@@ -279,6 +351,7 @@ class ReplaySession:
                         {"alert_id": alert.alert_id, "decision": alert.decision.value},
                     )
                     self.sync_live_state()
+                self.publish_pipeline_events()
                 if self.repository:
                     record = self.validated.get(self.capture or "")
                     capture_id = record.capture_id if record else None
@@ -436,27 +509,36 @@ class ReplaySession:
 
 
 def create_app(
-    config: ConfigBundle, *, live_state: RedisLiveStateCache | None = None
+    config: ConfigBundle,
+    *,
+    live_state: RedisLiveStateCache | None = None,
+    repository_override: PostgresRepository | None = None,
 ) -> FastAPI:
     engine = CustodianEngine(config)
-    repository = None
+    repository = repository_override
     storage_error = None
     recovery_warnings: list[str] = []
     if config.storage.enabled:
         try:
-            repository = SQLiteRepository(config.storage.database_path)
+            repository = repository or PostgresRepository(config.storage.database_url)
             repository.initialize()
             seed_demo_users_if_needed(repository)
             repository.apply_retention(
                 retention_days=config.storage.retention_days,
-                max_database_bytes=config.storage.max_database_bytes,
             )
         except Exception as exc:
             storage_error = str(exc)
             repository = None
     event_hub = EventHub(max_events=min(config.defaults.max_temporal_events, 5000))
     live_state = live_state or RedisLiveStateCache(config.redis)
-    session = ReplaySession(engine, config, repository, event_hub, live_state)
+    event_bus = (
+        KafkaEventBus(config.kafka)
+        if config.kafka.enabled
+        else InProcessEventBus(max_events=min(config.defaults.max_temporal_events, 5000))
+    )
+    session = ReplaySession(engine, config, repository, event_hub, live_state, event_bus)
+    consumer_stop = asyncio.Event()
+    consumer_thread: Thread | None = None
     if repository:
         for payload in reversed(repository.list_alerts(limit=min(config.defaults.max_alerts, 500))):
             try:
@@ -466,12 +548,37 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app):
+        nonlocal consumer_thread
+        if config.kafka.enabled:
+            try:
+                event_bus.start_consumer()
+                consumer_stop.clear()
+
+                def consume():
+                    while not consumer_stop.is_set():
+                        try:
+                            event_bus.consume_once(session.handle_kafka_event)
+                        except Exception as exc:
+                            event_bus._error = f"consumer loop failed ({type(exc).__name__})"
+                            consumer_stop.wait(min(config.kafka.retry_backoff_seconds or 0.1, 5))
+
+                consumer_thread = Thread(
+                    target=consume, name="custodian-kafka-consumer", daemon=True
+                )
+                consumer_thread.start()
+            except Exception:
+                # Readiness reports degraded; replay continues without network actions.
+                pass
         yield
+        consumer_stop.set()
+        if consumer_thread:
+            await asyncio.to_thread(consumer_thread.join, 2)
         if session.running and session.controller:
             session.controller.stop()
         if session.thread:
             await asyncio.to_thread(session.thread.join, 2)
         live_state.close()
+        event_bus.close()
 
     app = FastAPI(
         title="Custodian API",
@@ -636,9 +743,23 @@ def create_app(
             for item in model_status
         }
         database_ready = repository is not None and not recovery_warnings
+        database_reason = "; ".join(recovery_warnings) or storage_error
+        if repository is not None:
+            try:
+                repository.health_check()
+            except Exception:
+                database_ready = False
+                database_reason = "PostgreSQL is unavailable"
+        else:
+            database_reason = database_reason or "Persistence is disabled"
+        database_status = (
+            "degraded" if recovery_warnings else "ready" if database_ready else "unavailable"
+        )
         return {
             "status": "ready"
-            if database_ready and all(item["enabled"] for item in model_status)
+            if database_ready
+            and all(item["enabled"] for item in model_status)
+            and event_bus.readiness()["status"] != "degraded"
             else "degraded",
             "passive_only": True,
             "outbound_traffic_path": False,
@@ -646,19 +767,12 @@ def create_app(
                 "parser": {"status": "ready", "reason": None},
                 "event_stream": {"status": "ready", "reason": None},
                 "database": {
-                    "status": "degraded"
-                    if recovery_warnings
-                    else "ready"
-                    if repository
-                    else "unavailable",
-                    "reason": "; ".join(recovery_warnings)
-                    if recovery_warnings
-                    else None
-                    if repository
-                    else storage_error or "Persistence is disabled",
+                    "status": database_status,
+                    "reason": database_reason if database_reason or not database_ready else None,
                 },
                 "models": model_components,
                 "redis": live_state.readiness(),
+                "kafka": event_bus.readiness(),
                 "inputs": {
                     item["source_type"]: {
                         "status": item["status"],
@@ -712,6 +826,14 @@ def create_app(
     def alerts(limit: int = 100, offset: int = 0):
         if not 1 <= limit <= 500 or offset < 0:
             raise HTTPException(status_code=400, detail="invalid alert pagination")
+        if repository is not None:
+            try:
+                # PostgreSQL orders newest first for paging; the UI consumes oldest to newest.
+                return list(reversed(repository.list_alerts(limit=limit, offset=offset)))
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503, detail="PostgreSQL alert storage is unavailable"
+                ) from exc
         records = list(engine.alerts)
         end = max(len(records) - offset, 0)
         start = max(end - limit, 0)
@@ -782,10 +904,25 @@ def create_app(
     def flows(limit: int = 100):
         if not 1 <= limit <= 500:
             raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
-        active = list(engine.flows.snapshots(limit=limit))
-        remaining = max(limit - len(active), 0)
-        completed = list(engine.recent_flows)[-remaining:] if remaining else []
-        return [flow.model_dump(mode="json") for flow in active + completed]
+        current = list(engine.flows.snapshots(limit=limit))
+        remaining = max(limit - len(current), 0)
+        current.extend(list(engine.recent_flows)[-remaining:] if remaining else [])
+        combined = {flow.flow_id: flow for flow in current}
+        if repository is not None:
+            try:
+                for payload in repository.list_flows(limit=limit):
+                    try:
+                        flow = FlowRecord.model_validate(payload)
+                    except ValidationError:
+                        # Kafka's minimized flow event is not a full dashboard FlowRecord.
+                        continue
+                    combined.setdefault(flow.flow_id, flow)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503, detail="PostgreSQL flow storage is unavailable"
+                ) from exc
+        records = sorted(combined.values(), key=lambda flow: flow.last_seen)
+        return [flow.model_dump(mode="json") for flow in records[-limit:]]
 
     @app.get(
         "/api/v1/timeline",
@@ -819,6 +956,7 @@ def create_app(
             "routing": list(engine.routing_diagnostics),
             "model_load_errors": dict(engine._load_errors),
             "inputs": adapter_statuses(),
+            "kafka": event_bus.readiness(),
         }
 
     @app.get("/api/v1/events", tags=["events"], summary="Poll events after a sequence cursor")
@@ -855,9 +993,7 @@ def create_app(
                 }
                 for item in detectors()
             ]
-            path = ExportService(
-                repository, config.storage.database_path.parent / "reports"
-            ).export_alerts(
+            path = ExportService(repository, Path("runtime/reports")).export_alerts(
                 request.format,
                 metadata={
                     "configuration_fingerprint": sha256(
@@ -887,9 +1023,7 @@ def create_app(
     def telemetry():
         snapshot = {"status": status(), "metrics": metrics(), "detectors": detectors()}
         live_state.set_replay_status(snapshot["status"])
-        live_state.set_detectors(
-            {"run_id": session.run_id, "detectors": snapshot["detectors"]}
-        )
+        live_state.set_detectors({"run_id": session.run_id, "detectors": snapshot["detectors"]})
         live_state.set_telemetry({**snapshot, "run_id": session.run_id})
         return snapshot
 
